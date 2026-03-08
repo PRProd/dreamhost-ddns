@@ -2,3 +2,4 @@
 /config.toml
 Cargo.lock
 dreamhost-dns.code-workspace
+build-bins.bat
