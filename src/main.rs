@@ -4,6 +4,8 @@ use log::{info, warn};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::net::IpAddr;
+use std::sync::mpsc;
+use std::thread;
 
 
 #[derive(Parser)]
@@ -103,33 +105,41 @@ fn load_config(path: &str) -> Result<Config> {
 
 
 fn get_wan_ip(client: &Client) -> Result<IpAddr> {
-
     let services = [
+        "https://icanhazip.com",
         "https://api.ipify.org",
         "https://ifconfig.me/ip",
         "https://checkip.amazonaws.com",
     ];
 
-    for url in services {
-        match client.get(url).send() {
-            Ok(resp) => {
-                if let Ok(text) = resp.text() {
-                    let trimmed = text.trim();
+    let (tx, rx) = mpsc::channel();
 
-                    if let Ok(ip) = trimmed.parse::<IpAddr>() {
-                        info!("WAN IP detected via {}: {}", url, ip);
-                        return Ok(ip);
-                    }
-                }
+    for url in services {
+        let tx = tx.clone();
+        let client = client.clone();
+        let url = url.to_string();
+
+        thread::spawn(move || {
+            let result = client.get(&url).send()
+                .and_then(|r| r.text())
+                .ok()
+                .and_then(|text| text.trim().parse::<IpAddr>().ok());
+
+            if let Some(ip) = result {
+                let _ = tx.send((url, ip));
             }
-            Err(e) => {
-                info!("WAN IP service {} failed: {}", url, e);
-                continue;
-            }
-        }
+        });
     }
 
-    Err(anyhow!("Could not determine WAN IP"))
+    drop(tx); // close channel when threads finish
+
+    match rx.recv() {
+        Ok((url, ip)) => {
+            info!("WAN IP detected via {}: {}", url, ip);
+            Ok(ip)
+        }
+        Err(_) => Err(anyhow!("Could not determine WAN IP")),
+    }
 }
 
 fn get_dns_ip(client: &Client, api_key: &str, record_name: &str) -> Result<String> {
