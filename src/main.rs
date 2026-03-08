@@ -51,14 +51,18 @@ fn main() -> Result<()> {
     }
 
     let config = load_config(&args.config)?;
-
     let api_key = config.dreamhost_api_key;
     let record = config.dns_record;
 
-    let wan_ip = get_wan_ip()?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .user_agent("dreamhost-ddns/1.0")
+        .build()?;
+
+    let wan_ip = get_wan_ip(&client)?;
     info!("Detected WAN IP: {}", wan_ip);
 
-    let dns_ip = get_dns_ip(&api_key, &record)?;
+    let dns_ip = get_dns_ip(&client, &api_key, &record)?;
     info!("DNS record IP: {}", dns_ip);
 
     if wan_ip.to_string() == dns_ip {
@@ -75,7 +79,7 @@ fn main() -> Result<()> {
         );
     } else {
         info!("Updating DNS...");
-        update_dns(&api_key, &record, &dns_ip, &wan_ip.to_string())?;
+        update_dns(&client, &api_key, &record, &dns_ip, &wan_ip.to_string())?;
     }
 
     info!("DNS updated successfully");
@@ -91,11 +95,7 @@ fn load_config(path: &str) -> Result<Config> {
 }
 
 
-fn get_wan_ip() -> Result<IpAddr> {
-    let client = Client::builder()
-    .timeout(std::time::Duration::from_secs(3))
-    .user_agent("dreamhost-ddns/1.0")
-    .build()?;
+fn get_wan_ip(client: &Client) -> Result<IpAddr> {
 
     let services = [
         "https://api.ipify.org",
@@ -125,8 +125,7 @@ fn get_wan_ip() -> Result<IpAddr> {
     Err(anyhow!("Could not determine WAN IP"))
 }
 
-fn get_dns_ip(api_key: &str, record_name: &str) -> Result<String> {
-    let client = Client::new();
+fn get_dns_ip(client: &Client, api_key: &str, record_name: &str) -> Result<String> {
 
     let res: ApiResponse = client
         .get("https://api.dreamhost.com/")
@@ -149,8 +148,7 @@ fn get_dns_ip(api_key: &str, record_name: &str) -> Result<String> {
     Err(anyhow!("DNS record not found"))
 }
 
-fn update_dns(api_key: &str, record: &str, old_ip: &str, new_ip: &str) -> Result<()> {
-    let client = Client::new();
+fn update_dns(client: &Client, api_key: &str, record: &str, old_ip: &str, new_ip: &str) -> Result<()> {
 
     info!("Adding new DNS record {} -> {}", record, new_ip);
 
