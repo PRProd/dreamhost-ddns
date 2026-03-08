@@ -1,4 +1,4 @@
 /target
-config.toml
+/config.toml
 Cargo.lock
 dreamhost-dns.code-workspace
