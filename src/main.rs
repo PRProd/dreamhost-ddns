@@ -7,6 +7,12 @@ use std::net::IpAddr;
 
 
 #[derive(Parser)]
+#[command(
+    name = "dreamhost-ddns",
+    version,
+    about = "Updates a DreamHost DNS A record with the current WAN IP",
+    long_about = None
+)]
 struct Args {
     #[arg(short, long)]
     verbose: bool,
@@ -16,6 +22,7 @@ struct Args {
 
     #[arg(long)]
     dry_run: bool,
+
 }
 
 #[derive(Debug, Deserialize)]
