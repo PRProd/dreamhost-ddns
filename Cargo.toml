@@ -1,0 +1,16 @@
+[package]
+name = "dreamhost-ddns"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+log = "0.4"
+env_logger = "0.11"
+trust-dns-resolver = "0.23"
