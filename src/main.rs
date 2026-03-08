@@ -139,13 +139,11 @@ fn get_dns_ip(client: &Client, api_key: &str, record_name: &str) -> Result<Strin
 
     let records = res.data.ok_or_else(|| anyhow!("No DNS data returned"))?;
 
-    for r in records {
-        if r.record == record_name && r.record_type == "A" {
-            return Ok(r.value);
-        }
-    }
-
-    Err(anyhow!("DNS record not found"))
+    records
+        .into_iter()
+        .find(|r| r.record == record_name && r.record_type == "A")
+        .map(|r| r.value)
+        .ok_or_else(|| anyhow!("DNS record not found"))
 }
 
 fn update_dns(client: &Client, api_key: &str, record: &str, old_ip: &str, new_ip: &str) -> Result<()> {
