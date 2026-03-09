@@ -19,21 +19,25 @@ Usage: dreamhost-ddns.exe [OPTIONS]
 
 Options:
   -v, --verbose
-  -c, --config <CONFIG>  [default: config.toml]
+  -c, --config <CONFIG>    [default: config.toml]
       --dry-run
-  -h, --help             Print help
-  -V, --version          Print version
+      --api-key <API_KEY>
+      --record <RECORD>
+  -h, --help               Print help
+  -V, --version            Print version
 ```
 ### Linux / Others
 ```
-Usage: dreamhost-ddns [OPTIONS]
+Usage: dreamhost-ddns.exe [OPTIONS]
 
 Options:
   -v, --verbose
-  -c, --config <CONFIG>  [default: config.toml]
+  -c, --config <CONFIG>    [default: config.toml]
       --dry-run
-  -h, --help             Print help
-  -V, --version          Print version
+      --api-key <API_KEY>
+      --record <RECORD>
+  -h, --help               Print help
+  -V, --version            Print version
 ```
 You will likely need to make the dreamhost-ddns file executable first:
 ```bash
