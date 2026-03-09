@@ -25,6 +25,11 @@ struct Args {
     #[arg(long)]
     dry_run: bool,
 
+    #[arg(long)]
+    api_key: Option<String>,
+
+    #[arg(long)]
+    record: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,8 +65,8 @@ fn main() -> Result<()> {
     }
 
     let config = load_config(&args.config)?;
-    let api_key = config.dreamhost_api_key;
-    let record = config.dns_record;
+    let api_key = args.api_key.unwrap_or(config.dreamhost_api_key);
+    let record = args.record.unwrap_or(config.dns_record);
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(3))
