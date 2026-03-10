@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use log::{info, warn};
+use clap::ValueEnum;
+use log::{info, warn, debug, trace};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::net::IpAddr;
@@ -18,6 +19,9 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
+    #[arg(long, value_enum)]
+    log_level: Option<LogLevel>,
+
     #[arg(short, long)]
     config: Option<String>,
 
@@ -29,6 +33,15 @@ struct Args {
 
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +63,18 @@ struct Config {
 struct DreamhostClient {
     client: Client,
     api_key: String,
+}
+
+impl From<LogLevel> for log::LevelFilter {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Error => log::LevelFilter::Error,
+            LogLevel::Warn  => log::LevelFilter::Warn,
+            LogLevel::Info  => log::LevelFilter::Info,
+            LogLevel::Debug => log::LevelFilter::Debug,
+            LogLevel::Trace => log::LevelFilter::Trace,
+        }
+    }
 }
 
 impl DreamhostClient {
@@ -84,6 +109,9 @@ impl DreamhostClient {
         ])?;
 
         let records: Vec<Record> = serde_json::from_value(resp["data"].clone())?;
+
+        debug!("All DNS records: {:?}", records);
+        trace!("Detailed DNS data: {:?}", resp);
 
         records
             .into_iter()
@@ -123,13 +151,17 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    if args.verbose {
-        env_logger::Builder::from_default_env()
-            .filter_level(log::LevelFilter::Info)
-            .init();
+    let level = if let Some(level) = args.log_level {
+        level.into()
+    } else if args.verbose {
+        log::LevelFilter::Info
     } else {
-        env_logger::init();
-    }
+        log::LevelFilter::Warn
+    };
+
+    env_logger::Builder::from_default_env()
+        .filter_level(level)
+        .init();
 
     let config = resolve_config(&args)?;
 
