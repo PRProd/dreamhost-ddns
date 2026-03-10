@@ -1,6 +1,6 @@
 [package]
 name = "dreamhost-ddns"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -14,6 +14,7 @@ dotenvy = "0.15"
 log = "0.4"
 env_logger = "0.11"
 trust-dns-resolver = "0.23"
+rand = "0.8"
 
 [profile.release]
 lto = true
