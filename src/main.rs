@@ -6,6 +6,7 @@ use serde::Deserialize;
 use std::net::IpAddr;
 use std::sync::mpsc;
 use std::thread;
+use rand::seq::SliceRandom;
 
 #[derive(Parser)]
 #[command(
@@ -25,9 +26,6 @@ struct Args {
 
     #[arg(long)]
     record: Option<String>,
-
-    #[arg(long, default_value_t = 300)]
-    interval: u64,
 
     #[arg(long)]
     dry_run: bool,
@@ -95,6 +93,7 @@ impl DreamhostClient {
     }
 
     fn update_dns(&self, record: &str, old_ip: &str, new_ip: &str) -> Result<()> {
+
         info!("Adding new DNS record {} -> {}", record, new_ip);
 
         self.call(&[
@@ -103,6 +102,9 @@ impl DreamhostClient {
             ("type", "A"),
             ("value", new_ip),
         ])?;
+
+        info!("Waiting briefly for DNS propagation...");
+        std::thread::sleep(std::time::Duration::from_secs(3));
 
         info!("Removing old DNS record {} -> {}", record, old_ip);
 
@@ -135,11 +137,10 @@ fn main() -> Result<()> {
     let record = args.record.unwrap_or(config.dns_record);
 
     info!("Record: {}", record);
-    info!("Check interval: {} seconds", args.interval);
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(5))
-        .user_agent("dreamhost-ddns/1.0")
+        .user_agent(format!("dreamhost-ddns/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
 
     let dh = DreamhostClient {
@@ -168,7 +169,7 @@ fn main() -> Result<()> {
     } else {
         info!("Updating DNS...");
         dh.update_dns(&record, &dns_ip, &wan_ip.to_string())?;
-        info!("DNS updated successfully");
+        info!("DNS updated successfully to {}", wan_ip);
     }
 
 
@@ -231,28 +232,43 @@ fn load_config(path: &str) -> Result<Config> {
 }
 
 fn get_wan_ip(client: &Client) -> Result<IpAddr> {
-    let services = [
+    let mut services = vec![
         "https://icanhazip.com",
         "https://api.ipify.org",
         "https://ifconfig.me/ip",
         "https://checkip.amazonaws.com",
     ];
 
+    services.shuffle(&mut rand::thread_rng());
+
     let (tx, rx) = mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     for url in services {
         let tx = tx.clone();
         let client = client.clone();
+        let cancel = cancel.clone();
         let url = url.to_string();
 
         thread::spawn(move || {
-            let result = client.get(&url).send()
+
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+
+            let result = client
+                .get(&url)
+                .send()
                 .and_then(|r| r.text())
                 .ok()
                 .and_then(|text| text.trim().parse::<IpAddr>().ok());
 
             if let Some(ip) = result {
-                let _ = tx.send((url, ip));
+
+                if !cancel.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tx.send((url, ip));
+                }
+
             }
         });
     }
@@ -261,7 +277,7 @@ fn get_wan_ip(client: &Client) -> Result<IpAddr> {
 
     match rx.recv() {
         Ok((url, ip)) => {
-            info!("WAN IP detected via {}: {}", url, ip);
+            info!("WAN IP detected via {}", url);
             Ok(ip)
         }
         Err(_) => Err(anyhow!("All WAN IP detection services failed")),
