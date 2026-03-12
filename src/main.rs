@@ -1,19 +1,19 @@
 use anyhow::{anyhow, Result};
-use clap::Parser;
-use clap::ValueEnum;
+use clap::{Parser, ValueEnum};
 use log::{info, warn, debug, trace};
+use rand::seq::SliceRandom;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::net::IpAddr;
 use std::sync::mpsc;
 use std::thread;
-use rand::seq::SliceRandom;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 #[derive(Parser)]
 #[command(
     name = "dreamhost-ddns",
     version,
-    about = "Updates a DreamHost DNS A record with the current WAN IP"
+    about = "Updates a DreamHost DNS A and AAAA record with the current WAN IP"
 )]
 struct Args {
     #[arg(short, long)]
@@ -78,7 +78,9 @@ impl From<LogLevel> for log::LevelFilter {
 }
 
 impl DreamhostClient {
+
     fn call(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
+
         let mut query = vec![
             ("key", self.api_key.as_str()),
             ("format", "json"),
@@ -103,23 +105,6 @@ impl DreamhostClient {
         Ok(resp)
     }
 
-    fn get_dns_ip(&self, record_name: &str) -> Result<String> {
-        let resp = self.call(&[
-            ("cmd", "dns-list_records"),
-        ])?;
-
-        let records: Vec<Record> = serde_json::from_value(resp["data"].clone())?;
-
-        debug!("All DNS records: {:?}", records);
-        trace!("Detailed DNS data: {:?}", resp);
-
-        records
-            .into_iter()
-            .find(|r| r.record == record_name && r.record_type == "A")
-            .map(|r| r.value)
-            .ok_or_else(|| anyhow!("DreamHost error: DNS record '{}' not found", record_name))
-    }
-
     fn list_records(&self) -> Result<Vec<Record>> {
 
         let resp = self.call(&[
@@ -131,29 +116,54 @@ impl DreamhostClient {
         Ok(records)
     }
 
+    fn get_dns_ip(&self, record_name: &str, record_type: &str) -> Result<String> {
+
+        let resp = self.call(&[
+            ("cmd", "dns-list_records"),
+        ])?;
+
+        let records: Vec<Record> = serde_json::from_value(resp["data"].clone())?;
+
+        debug!("All DNS records: {:?}", records);
+        trace!("Detailed DNS data: {:?}", resp);
+
+        records
+            .into_iter()
+            .find(|r| r.record == record_name && r.record_type == record_type)
+            .map(|r| r.value)
+            .ok_or_else(|| anyhow!("DreamHost error: {} record '{}' not found", record_type, record_name))
+    }
+
     fn record_exists(
         &self,
         record_name: &str,
         ip: &str,
+        record_type: &str,
     ) -> Result<bool> {
 
         let records = self.list_records()?;
 
         Ok(records.iter().any(|r|
             r.record == record_name &&
-            r.record_type == "A" &&
+            r.record_type == record_type &&
             r.value == ip
         ))
     }
 
-    fn update_dns(&self, record: &str, old_ip: &str, new_ip: &str) -> Result<()> {
+    fn update_dns(
+        &self,
+        record: &str,
+        old_ip: &str,
+        new_ip: &str,
+        record_type: &str
+    ) -> Result<()> {
 
-        info!("Adding new DNS record {} -> {}", record, new_ip);
+        info!("Adding new {} DNS record {} -> {}", record_type, record, new_ip);
 
         self.call(&[
             ("cmd", "dns-add_record"),
             ("record", record),
-            ("type", "A"),
+            ("type", record_type),
             ("value", new_ip),
         ])?;
 
@@ -162,33 +172,110 @@ impl DreamhostClient {
 
         for attempt in 1..=5 {
 
-            if self.record_exists(record, new_ip)? {
-                info!("New DNS record verified");
+            if self.record_exists(record, new_ip, record_type)? {
+                info!("New {} record verified", record_type);
                 break;
             }
 
-            warn!("New record not visible yet (attempt {})", attempt);
+            warn!("New {} record not visible yet (attempt {})", record_type, attempt);
             std::thread::sleep(std::time::Duration::from_secs(2));
 
             if attempt == 5 {
                 return Err(anyhow!(
-                    "New DNS record never appeared; refusing to remove old record"
+                    "New {} record never appeared; refusing to remove old record",
+                    record_type
                 ));
             }
         }
 
-        info!("Removing old DNS record {} -> {}", record, old_ip);
+        info!("Removing old {} DNS record {} -> {}", record_type, record, old_ip);
 
         self.call(&[
             ("cmd", "dns-remove_record"),
             ("record", record),
-            ("type", "A"),
+            ("type", record_type),
             ("value", old_ip),
         ])?;
 
         Ok(())
     }
+}
 
+fn check_and_update(
+    dh: &DreamhostClient,
+    record: &str,
+    detected_ip: IpAddr,
+    record_type: &str,
+    dry_run: bool,
+) -> Result<()> {
+
+    match dh.get_dns_ip(record, record_type) {
+
+        Ok(current_ip) => {
+
+            if let Ok(existing_ip) = current_ip.parse::<IpAddr>() {
+
+                if detected_ip == existing_ip {
+
+                    info!("{} record already up-to-date", record_type);
+                    return Ok(());
+
+                }
+
+            }
+
+            warn!("{} record mismatch detected", record_type);
+
+            if dry_run {
+
+                info!(
+                    "DRY RUN: Would update {} record {} -> {}",
+                    record_type,
+                    current_ip,
+                    detected_ip
+                );
+
+                return Ok(());
+            }
+
+            dh.update_dns(
+                record,
+                &current_ip,
+                &detected_ip.to_string(),
+                record_type,
+            )?;
+
+            info!("{} record updated successfully", record_type);
+
+        }
+
+        Err(_) => {
+
+            warn!("{} record does not exist, creating new one", record_type);
+
+            if dry_run {
+
+                info!(
+                    "DRY RUN: Would create {} record -> {}",
+                    record_type,
+                    detected_ip
+                );
+
+                return Ok(());
+            }
+
+            dh.call(&[
+                ("cmd", "dns-add_record"),
+                ("record", record),
+                ("type", record_type),
+                ("value", &detected_ip.to_string()),
+            ])?;
+
+            info!("{} record created successfully", record_type);
+        }
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -224,30 +311,48 @@ fn main() -> Result<()> {
         api_key,
     };
 
-    let wan_ip = get_wan_ip(&dh.client)?;
-    info!("Detected WAN IP: {}", wan_ip);
+    // IPv4
+    if let Ok(ipv4) = detect_ip(&dh.client, ipv4_services(), true) {
 
-    let dns_ip = dh.get_dns_ip(&record)?;
-    info!("DNS record IP: {}", dns_ip);
+        info!("Detected IPv4 WAN: {}", ipv4);
 
-    if wan_ip.to_string() == dns_ip {
-        info!("DNS already up-to-date");
-        return Ok(());
+        check_and_update(
+            &dh,
+            &record,
+            ipv4,
+            "A",
+            args.dry_run,
+        )?;
+
     }
 
-    warn!("IP mismatch detected.");
-
-    if args.dry_run {
-        info!(
-            "DRY RUN: Would update DNS record {} from {} to {}",
-            record, dns_ip, wan_ip
-        );
-    } else {
-        info!("Updating DNS...");
-        dh.update_dns(&record, &dns_ip, &wan_ip.to_string())?;
-        info!("DNS updated successfully to {}", wan_ip);
+    // IPv6
+    match detect_ip(&dh.client, ipv6_services(), false) {
+        Ok(ipv6) => {
+            info!("Detected IPv6 WAN: {}", ipv6);
+            check_and_update(&dh, &record, ipv6, "AAAA", args.dry_run)?;
+        }
+        Err(_) => {
+            info!("No IPv6 WAN detected");
+            match dh.get_dns_ip(&record, "AAAA") {
+                Ok(existing_ip) => {
+                    warn!("IPv6 not detected but AAAA record exists: {}", existing_ip);
+                    if args.dry_run {
+                        info!("DRY RUN: Would remove stale AAAA record {}", existing_ip);
+                    } else {
+                        dh.call(&[
+                            ("cmd", "dns-remove_record"),
+                            ("record", &record),
+                            ("type", "AAAA"),
+                            ("value", &existing_ip),
+                        ])?;
+                        warn!("Removed stale AAAA record {}", existing_ip);
+                    }
+                }
+                Err(_) => debug!("No AAAA record exists; nothing to remove"),
+            }
+        }
     }
-
 
     Ok(())
 }
@@ -257,7 +362,6 @@ fn resolve_config(args: &Args) -> Result<Config> {
     let mut api_key = args.api_key.clone();
     let mut record = args.record.clone();
 
-    // Environment variables
     if api_key.is_none() {
         api_key = std::env::var("DREAMHOST_API_KEY").ok();
     }
@@ -266,8 +370,8 @@ fn resolve_config(args: &Args) -> Result<Config> {
         record = std::env::var("DNS_RECORD").ok();
     }
 
-    // Explicit config file
     if (api_key.is_none() || record.is_none()) && args.config.is_some() {
+
         let cfg = load_config(args.config.as_ref().unwrap())?;
 
         if api_key.is_none() {
@@ -279,8 +383,8 @@ fn resolve_config(args: &Args) -> Result<Config> {
         }
     }
 
-    // Default config.toml
     if (api_key.is_none() || record.is_none()) && std::path::Path::new("config.toml").exists() {
+
         let cfg = load_config("config.toml")?;
 
         if api_key.is_none() {
@@ -303,24 +407,19 @@ fn resolve_config(args: &Args) -> Result<Config> {
 
 fn load_config(path: &str) -> Result<Config> {
     let contents = std::fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&contents)?;
-    Ok(config)
+    Ok(toml::from_str(&contents)?)
 }
 
-fn get_wan_ip(client: &Client) -> Result<IpAddr> {
-    let mut services = vec![
-        "https://icanhazip.com",
-        "https://api.ipify.org",
-        "https://ifconfig.me/ip",
-        "https://checkip.amazonaws.com",
-    ];
+fn detect_ip(client: &Client, services: Vec<&str>, require_ipv4: bool) -> Result<IpAddr> {
 
+    let mut services = services;
     services.shuffle(&mut rand::thread_rng());
 
     let (tx, rx) = mpsc::channel();
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
 
     for url in services {
+
         let tx = tx.clone();
         let client = client.clone();
         let cancel = cancel.clone();
@@ -328,7 +427,7 @@ fn get_wan_ip(client: &Client) -> Result<IpAddr> {
 
         thread::spawn(move || {
 
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            if cancel.load(Ordering::Relaxed) {
                 return;
             }
 
@@ -341,10 +440,17 @@ fn get_wan_ip(client: &Client) -> Result<IpAddr> {
 
             if let Some(ip) = result {
 
-                if !cancel.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    let _ = tx.send((url, ip));
+                if require_ipv4 && !ip.is_ipv4() {
+                    return;
                 }
 
+                if !require_ipv4 && !ip.is_ipv6() {
+                    return;
+                }
+
+                if !cancel.swap(true, Ordering::Relaxed) {
+                    let _ = tx.send((url, ip));
+                }
             }
         });
     }
@@ -358,4 +464,25 @@ fn get_wan_ip(client: &Client) -> Result<IpAddr> {
         }
         Err(_) => Err(anyhow!("All WAN IP detection services failed")),
     }
+}
+
+fn ipv4_services() -> Vec<&'static str> {
+
+    vec![
+        "https://icanhazip.com",
+        "https://api.ipify.org",
+        "https://ident.me",
+        "https://ifconfig.me/ip",
+        "https://checkip.amazonaws.com",
+    ]
+}
+
+fn ipv6_services() -> Vec<&'static str> {
+
+    vec![
+        "https://api64.ipify.org",
+        "https://ipv6.icanhazip.com",
+        "https://v6.ident.me",
+        "https://api-ipv6.ip.sb/ip",
+    ]
 }
