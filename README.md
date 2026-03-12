@@ -2,8 +2,8 @@
 ![Rust](https://img.shields.io/badge/rust-1.71+-orange.svg)
 [![License: GPL v3](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust](https://github.com/PRProd/dreamhost-ddns/actions/workflows/rust.yml/badge.svg)](https://github.com/PRProd/dreamhost-ddns/actions/workflows/rust.yml)
-
 <br>
+
 A lightweight Rust CLI tool that updates a DreamHost DNS **A record** with your current public IP address.
 
 This tool is designed for:
