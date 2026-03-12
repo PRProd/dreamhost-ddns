@@ -120,6 +120,32 @@ impl DreamhostClient {
             .ok_or_else(|| anyhow!("DreamHost error: DNS record '{}' not found", record_name))
     }
 
+    fn list_records(&self) -> Result<Vec<Record>> {
+
+        let resp = self.call(&[
+            ("cmd", "dns-list_records"),
+        ])?;
+
+        let records: Vec<Record> = serde_json::from_value(resp["data"].clone())?;
+
+        Ok(records)
+    }
+
+    fn record_exists(
+        &self,
+        record_name: &str,
+        ip: &str,
+    ) -> Result<bool> {
+
+        let records = self.list_records()?;
+
+        Ok(records.iter().any(|r|
+            r.record == record_name &&
+            r.record_type == "A" &&
+            r.value == ip
+        ))
+    }
+
     fn update_dns(&self, record: &str, old_ip: &str, new_ip: &str) -> Result<()> {
 
         info!("Adding new DNS record {} -> {}", record, new_ip);
@@ -134,6 +160,23 @@ impl DreamhostClient {
         info!("Waiting briefly for DNS propagation...");
         std::thread::sleep(std::time::Duration::from_secs(3));
 
+        for attempt in 1..=5 {
+
+            if self.record_exists(record, new_ip)? {
+                info!("New DNS record verified");
+                break;
+            }
+
+            warn!("New record not visible yet (attempt {})", attempt);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+
+            if attempt == 5 {
+                return Err(anyhow!(
+                    "New DNS record never appeared; refusing to remove old record"
+                ));
+            }
+        }
+
         info!("Removing old DNS record {} -> {}", record, old_ip);
 
         self.call(&[
@@ -145,6 +188,7 @@ impl DreamhostClient {
 
         Ok(())
     }
+
 }
 
 fn main() -> Result<()> {
