@@ -171,7 +171,6 @@ impl DreamhostClient {
     }
 
     fn list_records(&self) -> Result<Vec<Record>> {
-        // Check cache first
         let mut cache = self.record_cache.lock().unwrap();
         if let Some(records) = cache.as_ref() {
             debug!("Using cached DNS records");
@@ -179,9 +178,18 @@ impl DreamhostClient {
         }
 
         let resp = self.call(&[("cmd", "dns-list_records")])?;
-        let records: Vec<Record> = serde_json::from_value(resp["data"].clone())?;
+        
+        // Ensure we have a JSON array for data; else, treat as error
+        let records: Vec<Record> = match &resp["data"] {
+            serde_json::Value::Array(arr) => serde_json::from_value(serde_json::Value::Array(arr.clone()))?,
+            _ => {
+                // "data" might be a string like "slow_down_bucko"
+                let reason = resp["reason"].as_str().unwrap_or("Unknown DreamHost API error");
+                return Err(anyhow!("DreamHost API error: {}", reason));
+            }
+        };
 
-        *cache = Some(records.clone()); // store in cache
+        *cache = Some(records.clone()); // cache it
         Ok(records)
     }
 
@@ -266,68 +274,48 @@ fn check_and_update(
 ) -> Result<()> {
 
     match dh.get_dns_ip(record, record_type) {
-
         Ok(current_ip) => {
-
+            // Existing record exists, update if necessary
             if let Ok(existing_ip) = current_ip.parse::<IpAddr>() {
-
                 if detected_ip == existing_ip {
-
                     info!("{} record already up-to-date", record_type);
                     return Ok(());
-
                 }
-
             }
 
             warn!("{} record mismatch detected", record_type);
 
             if dry_run {
-
-                info!(
-                    "DRY RUN: Would update {} record {} -> {}",
-                    record_type,
-                    current_ip,
-                    detected_ip
-                );
-
+                info!("DRY RUN: Would update {} record {} -> {}", record_type, current_ip, detected_ip);
                 return Ok(());
             }
 
-            dh.update_dns(
-                record,
-                &current_ip,
-                &detected_ip.to_string(),
-                record_type,
-            )?;
-
+            dh.update_dns(record, &current_ip, &detected_ip.to_string(), record_type)?;
             info!("{} record updated successfully", record_type);
-
         }
 
-        Err(_) => {
+        Err(e) => {
+            // Only create record if the error indicates "not found"
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                warn!("{} record does not exist, creating new one", record_type);
 
-            warn!("{} record does not exist, creating new one", record_type);
+                if dry_run {
+                    info!("DRY RUN: Would create {} record -> {}", record_type, detected_ip);
+                    return Ok(());
+                }
 
-            if dry_run {
-
-                info!(
-                    "DRY RUN: Would create {} record -> {}",
-                    record_type,
-                    detected_ip
-                );
-
-                return Ok(());
+                dh.call(&[
+                    ("cmd", "dns-add_record"),
+                    ("record", record),
+                    ("type", record_type),
+                    ("value", &detected_ip.to_string()),
+                ])?;
+                info!("{} record created successfully", record_type);
+            } else {
+                // Propagate all other errors (API errors, rate limits, network errors)
+                return Err(e);
             }
-
-            dh.call(&[
-                ("cmd", "dns-add_record"),
-                ("record", record),
-                ("type", record_type),
-                ("value", &detected_ip.to_string()),
-            ])?;
-
-            info!("{} record created successfully", record_type);
         }
     }
 
@@ -375,36 +363,45 @@ fn main() -> Result<()> {
 
     impl DetectionJob {
         fn run(self, dh: &Arc<DreamhostClient>) -> Result<()> {
+
+            // helper to safely remove a DNS record if it exists
+            let remove_stale_record = |record_type: &str, record_name: &str| -> Result<()> {
+                match dh.get_dns_ip(record_name, record_type) {
+                    Ok(existing_ip) => {
+                        warn!("{} record exists but no WAN IP detected: {}", record_type, existing_ip);
+                        if self.dry_run {
+                            info!("DRY RUN: Would remove stale {} record {}", record_type, existing_ip);
+                        } else {
+                            dh.call(&[
+                                ("cmd", "dns-remove_record"),
+                                ("record", record_name),
+                                ("type", record_type),
+                                ("value", &existing_ip),
+                            ])?;
+                            warn!("Removed stale {} record {}", record_type, existing_ip);
+                        }
+                    }
+                    Err(_) => debug!("No {} record exists; nothing to remove", record_type),
+                }
+                Ok(())
+            };
+
             match detect_ip(&self.client, self.services, self.require_ipv4) {
                 Ok(ip) => {
-                    info!("Detected {} WAN: {}", self.record_type, ip);
+                    let ipv = if self.record_type=="A" { "IPV4" } else { "IPV6" };
+                    info!("Detected {} WAN: {}", ipv, ip);
                     check_and_update(dh, &self.record_name, ip, self.record_type, self.dry_run)?;
                 }
                 Err(_) => {
                     if self.record_type == "AAAA" {
                         info!("No IPv6 WAN detected");
-                        match dh.get_dns_ip(&self.record_name, "AAAA") {
-                            Ok(existing_ip) => {
-                                warn!("IPv6 not detected but AAAA record exists: {}", existing_ip);
-                                if self.dry_run {
-                                    info!("DRY RUN: Would remove stale AAAA record {}", existing_ip);
-                                } else {
-                                    dh.call(&[
-                                        ("cmd", "dns-remove_record"),
-                                        ("record", &self.record_name),
-                                        ("type", "AAAA"),
-                                        ("value", &existing_ip),
-                                    ])?;
-                                    warn!("Removed stale AAAA record {}", existing_ip);
-                                }
-                            }
-                            Err(_) => debug!("No AAAA record exists; nothing to remove"),
-                        }
+                        remove_stale_record("AAAA", &self.record_name)?;
                     } else {
                         warn!("No IPv4 WAN detected");
                     }
                 }
             }
+
             Ok(())
         }
     }
