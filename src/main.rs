@@ -79,31 +79,83 @@ impl From<LogLevel> for log::LevelFilter {
 
 impl DreamhostClient {
 
-    fn call(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
+fn call(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
 
-        let mut query = vec![
-            ("key", self.api_key.as_str()),
-            ("format", "json"),
-        ];
+    let mut query = vec![
+        ("key", self.api_key.as_str()),
+        ("format", "json"),
+    ];
 
-        query.extend_from_slice(params);
+    query.extend_from_slice(params);
 
-        let resp: serde_json::Value = self.client
-            .get("https://api.dreamhost.com/")
-            .query(&query)
-            .send()?
-            .json()?;
+    let mut request = self.client
+        .get("https://api.dreamhost.com/")
+        .query(&query)
+        .build()?;
 
-        if resp["result"] != "success" {
-            let reason = resp["reason"]
-                .as_str()
-                .unwrap_or("Unknown DreamHost API error");
+    // ensure user-agent is visible in trace logs
+    if !request.headers().contains_key(reqwest::header::USER_AGENT) {
+        request.headers_mut().insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_str(
+                &format!("dreamhost-ddns/{}", env!("CARGO_PKG_VERSION"))
+            )?,
+        );
+    }
 
-            return Err(anyhow!("DreamHost API error: {}", reason));
+    // ---- TRACE REQUEST LOGGING ----
+    if log::log_enabled!(log::Level::Trace) {
+
+        let mut url = request.url().to_string();
+
+        // mask API key
+        if let Some(start) = url.find("key=") {
+            let end = url[start..].find('&').map(|i| start + i).unwrap_or(url.len());
+            url.replace_range(start + 4..end, "***");
         }
 
-        Ok(resp)
+        trace!("HTTP Request: {} {}", request.method(), url);
+
+        if request.headers().is_empty() {
+            trace!("HTTP Request Headers: <none>");
+        } else {
+            for (name, value) in request.headers() {
+                trace!("HTTP Header: {} = {:?}", name, value);
+            }
+        }
     }
+
+    // ---- SEND REQUEST ----
+    let response = self.client.execute(request)?;
+
+    // ---- TRACE RESPONSE LOGGING ----
+    if log::log_enabled!(log::Level::Trace) {
+
+        trace!("HTTP Status: {}", response.status());
+
+        for (name, value) in response.headers() {
+            trace!("Response Header: {} = {:?}", name, value);
+        }
+    }
+
+    let resp: serde_json::Value = response.json()?;
+
+    if log::log_enabled!(log::Level::Trace) {
+        trace!("HTTP Response JSON: {:?}", resp);
+    }
+
+    // ---- DREAMHOST API ERROR HANDLING ----
+    if resp["result"] != "success" {
+
+        let reason = resp["reason"]
+            .as_str()
+            .unwrap_or("Unknown DreamHost API error");
+
+        return Err(anyhow!("DreamHost API error: {}", reason));
+    }
+
+    Ok(resp)
+}
 
     fn list_records(&self) -> Result<Vec<Record>> {
 
