@@ -4,7 +4,7 @@
 [![Rust](https://github.com/PRProd/dreamhost-ddns/actions/workflows/rust.yml/badge.svg)](https://github.com/PRProd/dreamhost-ddns/actions/workflows/rust.yml)
 <br>
 
-A lightweight Rust CLI tool that updates a DreamHost DNS **A record** with your current public IP address.
+A lightweight Rust CLI tool that updates a DreamHost **DNS A** and **DNA AAAA** record with your current public WAN IP.
 
 This tool is designed for:
 
@@ -20,13 +20,16 @@ It detects your current WAN IP and updates the DNS record **only when necessary*
 
 ## Features
 
+* **IPv4 and IPv6 support** (dual stack)
 * Fast public IP detection using multiple services
-* Safe DNS updates that prevent outages
-* Multiple configuration methods (CLI, env vars, config file)
-* Structured logging with selectable log levels
-* Designed for automation environments like Home Assistant
-* Small, fast Rust binary with minimal dependencies
-
+* Safe DNS updates with propagation validation
+* Reduces API calls via DNS record caching
+* Smart error handling (including rate‑limit and API faults)
+* Structured logging with configurable levels
+* Supports config from CLI, environment variables, or file
+* Dry‑run mode for verification w/o making changes
+* Small, fast Rust binary
+  
 ---
 
 ## How It Works
@@ -68,10 +71,18 @@ If verification fails, the old record **is not removed**, ensuring your hostname
 
 Your public IP is detected using multiple services in parallel:
 
+**IPv4 services:**
 * https://icanhazip.com
 * https://api.ipify.org
+* https://ident.me
 * https://ifconfig.me/ip
 * https://checkip.amazonaws.com
+
+**IPv6 services:**
+* https://api64.ipify.org
+* https://ipv6.icanhazip.com
+* https://v6.ident.me
+* https://api-ipv6.ip.sb/ip
 
 The first successful response is used, improving reliability and speed.
 
@@ -116,15 +127,17 @@ dreamhost-ddns \
   --record home.example.com
 ```
 
-Available arguments:
+Available options:
 
 ```
---api-key <KEY>       DreamHost API key
---record <HOSTNAME>   DNS A record to update
---config <FILE>       Optional config file
---log-level <LEVEL>   Logging level
---verbose             Shortcut for info-level logging
---dry-run             Show actions without modifying DNS
+--api-key <KEY>        DreamHost API key
+--record <HOSTNAME>    DNS record to update
+--config <FILE>        Optional config file
+--log-level <LEVEL>    Logging level (error, warn, info, debug, trace)
+--verbose              Shortcut for info level
+--dry-run              Show actions without modifying DNS
+--ipv4-only            Only detect & update IPv4 ("A")
+--ipv6-only            Only detect & update IPv6 ("AAAA")
 ```
 
 ---
