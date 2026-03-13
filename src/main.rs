@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::net::IpAddr;
 use std::sync::mpsc;
 use std::thread;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +33,12 @@ struct Args {
 
     #[arg(long)]
     dry_run: bool,
+
+    #[arg(long, conflicts_with = "ipv6_only")]
+    ipv4_only: bool,
+
+    #[arg(long, conflicts_with = "ipv4_only")]
+    ipv6_only: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -44,13 +50,11 @@ enum LogLevel {
     Trace,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Record {
     record: String,
-
     #[serde(rename = "type")]
     record_type: String,
-
     value: String,
 }
 
@@ -63,6 +67,7 @@ struct Config {
 struct DreamhostClient {
     client: Client,
     api_key: String,
+    record_cache: Mutex<Option<Vec<Record>>>,
 }
 
 impl From<LogLevel> for log::LevelFilter {
@@ -79,106 +84,111 @@ impl From<LogLevel> for log::LevelFilter {
 
 impl DreamhostClient {
 
-fn call(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
-
-    let mut query = vec![
-        ("key", self.api_key.as_str()),
-        ("format", "json"),
-    ];
-
-    query.extend_from_slice(params);
-
-    let mut request = self.client
-        .get("https://api.dreamhost.com/")
-        .query(&query)
-        .build()?;
-
-    // ensure user-agent is visible in trace logs
-    if !request.headers().contains_key(reqwest::header::USER_AGENT) {
-        request.headers_mut().insert(
-            reqwest::header::USER_AGENT,
-            reqwest::header::HeaderValue::from_str(
-                &format!("dreamhost-ddns/{}", env!("CARGO_PKG_VERSION"))
-            )?,
-        );
+    pub fn new(client: Client, api_key: String) -> Self {
+        Self {
+            client,
+            api_key,
+            record_cache: Mutex::new(None),
+        }
     }
 
-    // ---- TRACE REQUEST LOGGING ----
-    if log::log_enabled!(log::Level::Trace) {
+    fn call(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
 
-        let mut url = request.url().to_string();
+        let mut query = vec![
+            ("key", self.api_key.as_str()),
+            ("format", "json"),
+        ];
 
-        // mask API key
-        if let Some(start) = url.find("key=") {
-            let end = url[start..].find('&').map(|i| start + i).unwrap_or(url.len());
-            url.replace_range(start + 4..end, "***");
+        query.extend_from_slice(params);
+
+        let mut request = self.client
+            .get("https://api.dreamhost.com/")
+            .query(&query)
+            .build()?;
+
+        // ensure user-agent is visible in trace logs
+        if !request.headers().contains_key(reqwest::header::USER_AGENT) {
+            request.headers_mut().insert(
+                reqwest::header::USER_AGENT,
+                reqwest::header::HeaderValue::from_str(
+                    &format!("dreamhost-ddns/{}", env!("CARGO_PKG_VERSION"))
+                )?,
+            );
         }
 
-        trace!("HTTP Request: {} {}", request.method(), url);
+        // ---- TRACE REQUEST LOGGING ----
+        if log::log_enabled!(log::Level::Trace) {
 
-        if request.headers().is_empty() {
-            trace!("HTTP Request Headers: <none>");
-        } else {
-            for (name, value) in request.headers() {
-                trace!("HTTP Header: {} = {:?}", name, value);
+            let mut url = request.url().to_string();
+
+            // mask API key
+            if let Some(start) = url.find("key=") {
+                let end = url[start..].find('&').map(|i| start + i).unwrap_or(url.len());
+                url.replace_range(start + 4..end, "***");
+            }
+
+            trace!("HTTP Request: {} {}", request.method(), url);
+
+            if request.headers().is_empty() {
+                trace!("HTTP Request Headers: <none>");
+            } else {
+                for (name, value) in request.headers() {
+                    trace!("HTTP Header: {} = {:?}", name, value);
+                }
             }
         }
-    }
 
-    // ---- SEND REQUEST ----
-    let response = self.client.execute(request)?;
+        // ---- SEND REQUEST ----
+        let response = self.client.execute(request)?;
 
-    // ---- TRACE RESPONSE LOGGING ----
-    if log::log_enabled!(log::Level::Trace) {
+        // ---- TRACE RESPONSE LOGGING ----
+        if log::log_enabled!(log::Level::Trace) {
 
-        trace!("HTTP Status: {}", response.status());
+            trace!("HTTP Status: {}", response.status());
 
-        for (name, value) in response.headers() {
-            trace!("Response Header: {} = {:?}", name, value);
+            for (name, value) in response.headers() {
+                trace!("Response Header: {} = {:?}", name, value);
+            }
         }
+
+        let resp: serde_json::Value = response.json()?;
+
+        if log::log_enabled!(log::Level::Trace) {
+            trace!("HTTP Response JSON: {:?}", resp);
+        }
+
+        // ---- DREAMHOST API ERROR HANDLING ----
+        if resp["result"] != "success" {
+
+            let reason = resp["reason"]
+                .as_str()
+                .unwrap_or("Unknown DreamHost API error");
+
+            return Err(anyhow!("DreamHost API error: {}", reason));
+        }
+
+        Ok(resp)
     }
-
-    let resp: serde_json::Value = response.json()?;
-
-    if log::log_enabled!(log::Level::Trace) {
-        trace!("HTTP Response JSON: {:?}", resp);
-    }
-
-    // ---- DREAMHOST API ERROR HANDLING ----
-    if resp["result"] != "success" {
-
-        let reason = resp["reason"]
-            .as_str()
-            .unwrap_or("Unknown DreamHost API error");
-
-        return Err(anyhow!("DreamHost API error: {}", reason));
-    }
-
-    Ok(resp)
-}
 
     fn list_records(&self) -> Result<Vec<Record>> {
+        // Check cache first
+        let mut cache = self.record_cache.lock().unwrap();
+        if let Some(records) = cache.as_ref() {
+            debug!("Using cached DNS records");
+            return Ok(records.clone());
+        }
 
-        let resp = self.call(&[
-            ("cmd", "dns-list_records"),
-        ])?;
-
+        let resp = self.call(&[("cmd", "dns-list_records")])?;
         let records: Vec<Record> = serde_json::from_value(resp["data"].clone())?;
 
+        *cache = Some(records.clone()); // store in cache
         Ok(records)
     }
 
     fn get_dns_ip(&self, record_name: &str, record_type: &str) -> Result<String> {
-
-        let resp = self.call(&[
-            ("cmd", "dns-list_records"),
-        ])?;
-
-        let records: Vec<Record> = serde_json::from_value(resp["data"].clone())?;
+        let records = self.list_records()?; // uses cache if available
 
         debug!("All DNS records: {:?}", records);
-        trace!("Detailed DNS data: {:?}", resp);
-
         records
             .into_iter()
             .find(|r| r.record == record_name && r.record_type == record_type)
@@ -186,20 +196,14 @@ fn call(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
             .ok_or_else(|| anyhow!("DreamHost error: {} record '{}' not found", record_type, record_name))
     }
 
-    fn record_exists(
-        &self,
-        record_name: &str,
-        ip: &str,
-        record_type: &str,
-    ) -> Result<bool> {
+    fn record_exists(&self, record_name: &str, ip: &str, record_type: &str) -> Result<bool> {
+        let records = self.list_records()?; // uses cache if available
+        Ok(records.iter().any(|r| r.record == record_name && r.record_type == record_type && r.value == ip))
+    }
 
-        let records = self.list_records()?;
-
-        Ok(records.iter().any(|r|
-            r.record == record_name &&
-            r.record_type == record_type &&
-            r.value == ip
-        ))
+    fn invalidate_cache(&self) {
+        let mut cache = self.record_cache.lock().unwrap();
+        *cache = None;
     }
 
     fn update_dns(
@@ -211,7 +215,6 @@ fn call(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
     ) -> Result<()> {
 
         info!("Adding new {} DNS record {} -> {}", record_type, record, new_ip);
-
         self.call(&[
             ("cmd", "dns-add_record"),
             ("record", record),
@@ -219,16 +222,16 @@ fn call(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
             ("value", new_ip),
         ])?;
 
+        self.invalidate_cache(); // records have changed, refresh cache
+
         info!("Waiting briefly for DNS propagation...");
         std::thread::sleep(std::time::Duration::from_secs(3));
 
         for attempt in 1..=5 {
-
             if self.record_exists(record, new_ip, record_type)? {
                 info!("New {} record verified", record_type);
                 break;
             }
-
             warn!("New {} record not visible yet (attempt {})", record_type, attempt);
             std::thread::sleep(std::time::Duration::from_secs(2));
 
@@ -241,13 +244,14 @@ fn call(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
         }
 
         info!("Removing old {} DNS record {} -> {}", record_type, record, old_ip);
-
         self.call(&[
             ("cmd", "dns-remove_record"),
             ("record", record),
             ("type", record_type),
             ("value", old_ip),
         ])?;
+
+        self.invalidate_cache(); // records changed again
 
         Ok(())
     }
@@ -331,7 +335,6 @@ fn check_and_update(
 }
 
 fn main() -> Result<()> {
-
     let args = Args::parse();
 
     let level = if let Some(level) = args.log_level {
@@ -358,56 +361,100 @@ fn main() -> Result<()> {
         .user_agent(format!("dreamhost-ddns/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
 
-    let dh = DreamhostClient {
-        client,
-        api_key,
-    };
+    let dh = Arc::new(DreamhostClient::new(client.clone(), api_key));
 
-    // IPv4
-    if let Ok(ipv4) = detect_ip(&dh.client, ipv4_services(), true) {
-
-        info!("Detected IPv4 WAN: {}", ipv4);
-
-        check_and_update(
-            &dh,
-            &record,
-            ipv4,
-            "A",
-            args.dry_run,
-        )?;
-
+    // ---- Define detection jobs ----
+    struct DetectionJob {
+        client: Client,
+        services: Vec<&'static str>,
+        require_ipv4: bool,
+        record_type: &'static str,
+        record_name: String,
+        dry_run: bool,
     }
 
-    // IPv6
-    match detect_ip(&dh.client, ipv6_services(), false) {
-        Ok(ipv6) => {
-            info!("Detected IPv6 WAN: {}", ipv6);
-            check_and_update(&dh, &record, ipv6, "AAAA", args.dry_run)?;
-        }
-        Err(_) => {
-            info!("No IPv6 WAN detected");
-            match dh.get_dns_ip(&record, "AAAA") {
-                Ok(existing_ip) => {
-                    warn!("IPv6 not detected but AAAA record exists: {}", existing_ip);
-                    if args.dry_run {
-                        info!("DRY RUN: Would remove stale AAAA record {}", existing_ip);
+    impl DetectionJob {
+        fn run(self, dh: &Arc<DreamhostClient>) -> Result<()> {
+            match detect_ip(&self.client, self.services, self.require_ipv4) {
+                Ok(ip) => {
+                    info!("Detected {} WAN: {}", self.record_type, ip);
+                    check_and_update(dh, &self.record_name, ip, self.record_type, self.dry_run)?;
+                }
+                Err(_) => {
+                    if self.record_type == "AAAA" {
+                        info!("No IPv6 WAN detected");
+                        match dh.get_dns_ip(&self.record_name, "AAAA") {
+                            Ok(existing_ip) => {
+                                warn!("IPv6 not detected but AAAA record exists: {}", existing_ip);
+                                if self.dry_run {
+                                    info!("DRY RUN: Would remove stale AAAA record {}", existing_ip);
+                                } else {
+                                    dh.call(&[
+                                        ("cmd", "dns-remove_record"),
+                                        ("record", &self.record_name),
+                                        ("type", "AAAA"),
+                                        ("value", &existing_ip),
+                                    ])?;
+                                    warn!("Removed stale AAAA record {}", existing_ip);
+                                }
+                            }
+                            Err(_) => debug!("No AAAA record exists; nothing to remove"),
+                        }
                     } else {
-                        dh.call(&[
-                            ("cmd", "dns-remove_record"),
-                            ("record", &record),
-                            ("type", "AAAA"),
-                            ("value", &existing_ip),
-                        ])?;
-                        warn!("Removed stale AAAA record {}", existing_ip);
+                        warn!("No IPv4 WAN detected");
                     }
                 }
-                Err(_) => debug!("No AAAA record exists; nothing to remove"),
             }
+            Ok(())
         }
+    }
+
+    // ---- Build jobs according to flags ----
+    let mut jobs = Vec::new();
+
+    // If neither flag is set, run both by default
+    if !args.ipv6_only {
+        jobs.push(DetectionJob {
+            client: client.clone(),
+            services: ipv4_services(),
+            require_ipv4: true,
+            record_type: "A",
+            record_name: record.clone(),
+            dry_run: args.dry_run,
+        });
+    }
+
+    if !args.ipv4_only {
+        jobs.push(DetectionJob {
+            client: client.clone(),
+            services: ipv6_services(),
+            require_ipv4: false,
+            record_type: "AAAA",
+            record_name: record.clone(),
+            dry_run: args.dry_run,
+        });
+    }
+
+    if jobs.is_empty() {
+        return Err(anyhow!("Both --ipv4-only and --ipv6-only flags cannot be used together; nothing to do"));
+    }
+
+    let handles: Vec<_> = jobs
+        .into_iter()
+        .map(|job| {
+            let dh_clone = dh.clone();
+            thread::spawn(move || job.run(&dh_clone))
+        })
+        .collect();
+
+    // ---- Join threads and propagate any errors ----
+    for handle in handles {
+        handle.join().expect("Thread panicked")?;
     }
 
     Ok(())
 }
+
 
 fn resolve_config(args: &Args) -> Result<Config> {
 
@@ -536,5 +583,6 @@ fn ipv6_services() -> Vec<&'static str> {
         "https://ipv6.icanhazip.com",
         "https://v6.ident.me",
         "https://api-ipv6.ip.sb/ip",
+        "https://ifconfig.co/ip",
     ]
 }
