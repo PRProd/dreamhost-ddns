@@ -1,13 +1,16 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
-use log::{info, warn, debug, trace};
+use log::{debug, info, trace, warn};
 use rand::seq::SliceRandom;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::net::IpAddr;
 use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
 
 #[derive(Parser)]
 #[command(
@@ -67,6 +70,7 @@ struct Config {
 struct DreamhostClient {
     client: Client,
     api_key: String,
+    base_url: String,
     record_cache: Mutex<Option<Vec<Record>>>,
 }
 
@@ -74,8 +78,8 @@ impl From<LogLevel> for log::LevelFilter {
     fn from(level: LogLevel) -> Self {
         match level {
             LogLevel::Error => log::LevelFilter::Error,
-            LogLevel::Warn  => log::LevelFilter::Warn,
-            LogLevel::Info  => log::LevelFilter::Info,
+            LogLevel::Warn => log::LevelFilter::Warn,
+            LogLevel::Info => log::LevelFilter::Info,
             LogLevel::Debug => log::LevelFilter::Debug,
             LogLevel::Trace => log::LevelFilter::Trace,
         }
@@ -83,47 +87,53 @@ impl From<LogLevel> for log::LevelFilter {
 }
 
 impl DreamhostClient {
-
     pub fn new(client: Client, api_key: String) -> Self {
         Self {
             client,
             api_key,
+            base_url: "https://api.dreamhost.com/".to_string(),
+            record_cache: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_base(client: Client, api_key: String, base_url: String) -> Self {
+        Self {
+            client,
+            api_key,
+            base_url,
             record_cache: Mutex::new(None),
         }
     }
 
     fn call(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
-
-        let mut query = vec![
-            ("key", self.api_key.as_str()),
-            ("format", "json"),
-        ];
+        let mut query = vec![("key", self.api_key.as_str()), ("format", "json")];
 
         query.extend_from_slice(params);
 
-        let mut request = self.client
-            .get("https://api.dreamhost.com/")
-            .query(&query)
-            .build()?;
+        let mut request = self.client.get(&self.base_url).query(&query).build()?;
 
         // ensure user-agent is visible in trace logs
         if !request.headers().contains_key(reqwest::header::USER_AGENT) {
             request.headers_mut().insert(
                 reqwest::header::USER_AGENT,
-                reqwest::header::HeaderValue::from_str(
-                    &format!("dreamhost-ddns/{}", env!("CARGO_PKG_VERSION"))
-                )?,
+                reqwest::header::HeaderValue::from_str(&format!(
+                    "dreamhost-ddns/{}",
+                    env!("CARGO_PKG_VERSION")
+                ))?,
             );
         }
 
         // ---- TRACE REQUEST LOGGING ----
         if log::log_enabled!(log::Level::Trace) {
-
             let mut url = request.url().to_string();
 
             // mask API key
             if let Some(start) = url.find("key=") {
-                let end = url[start..].find('&').map(|i| start + i).unwrap_or(url.len());
+                let end = url[start..]
+                    .find('&')
+                    .map(|i| start + i)
+                    .unwrap_or(url.len());
                 url.replace_range(start + 4..end, "***");
             }
 
@@ -143,7 +153,6 @@ impl DreamhostClient {
 
         // ---- TRACE RESPONSE LOGGING ----
         if log::log_enabled!(log::Level::Trace) {
-
             trace!("HTTP Status: {}", response.status());
 
             for (name, value) in response.headers() {
@@ -159,14 +168,13 @@ impl DreamhostClient {
 
         // ---- DREAMHOST API ERROR HANDLING ----
         if resp["result"] != "success" {
+            let reason = resp["reason"].as_str();
+            let data = resp["data"].as_str();
 
-            let reason = resp["reason"]
-                .as_str()
-                .unwrap_or("Unknown DreamHost API error");
+            let message = reason.or(data).unwrap_or("Unknown DreamHost API error");
 
-            return Err(anyhow!("DreamHost API error: {}", reason));
+            return Err(anyhow!("DreamHost API error: {}", message));
         }
-
         Ok(resp)
     }
 
@@ -178,13 +186,17 @@ impl DreamhostClient {
         }
 
         let resp = self.call(&[("cmd", "dns-list_records")])?;
-        
+
         // Ensure we have a JSON array for data; else, treat as error
         let records: Vec<Record> = match &resp["data"] {
-            serde_json::Value::Array(arr) => serde_json::from_value(serde_json::Value::Array(arr.clone()))?,
+            serde_json::Value::Array(arr) => {
+                serde_json::from_value(serde_json::Value::Array(arr.clone()))?
+            }
             _ => {
                 // "data" might be a string like "slow_down_bucko"
-                let reason = resp["reason"].as_str().unwrap_or("Unknown DreamHost API error");
+                let reason = resp["reason"]
+                    .as_str()
+                    .unwrap_or("Unknown DreamHost API error");
                 return Err(anyhow!("DreamHost API error: {}", reason));
             }
         };
@@ -201,12 +213,20 @@ impl DreamhostClient {
             .into_iter()
             .find(|r| r.record == record_name && r.record_type == record_type)
             .map(|r| r.value)
-            .ok_or_else(|| anyhow!("DreamHost error: {} record '{}' not found", record_type, record_name))
+            .ok_or_else(|| {
+                anyhow!(
+                    "DreamHost error: {} record '{}' not found",
+                    record_type,
+                    record_name
+                )
+            })
     }
 
     fn record_exists(&self, record_name: &str, ip: &str, record_type: &str) -> Result<bool> {
         let records = self.list_records()?; // uses cache if available
-        Ok(records.iter().any(|r| r.record == record_name && r.record_type == record_type && r.value == ip))
+        Ok(records
+            .iter()
+            .any(|r| r.record == record_name && r.record_type == record_type && r.value == ip))
     }
 
     fn invalidate_cache(&self) {
@@ -219,10 +239,12 @@ impl DreamhostClient {
         record: &str,
         old_ip: &str,
         new_ip: &str,
-        record_type: &str
+        record_type: &str,
     ) -> Result<()> {
-
-        info!("Adding new {} DNS record {} -> {}", record_type, record, new_ip);
+        info!(
+            "Adding new {} DNS record {} -> {}",
+            record_type, record, new_ip
+        );
         self.call(&[
             ("cmd", "dns-add_record"),
             ("record", record),
@@ -240,7 +262,10 @@ impl DreamhostClient {
                 info!("New {} record verified", record_type);
                 break;
             }
-            warn!("New {} record not visible yet (attempt {})", record_type, attempt);
+            warn!(
+                "New {} record not visible yet (attempt {})",
+                record_type, attempt
+            );
             std::thread::sleep(std::time::Duration::from_secs(2));
 
             if attempt == 5 {
@@ -251,7 +276,10 @@ impl DreamhostClient {
             }
         }
 
-        info!("Removing old {} DNS record {} -> {}", record_type, record, old_ip);
+        info!(
+            "Removing old {} DNS record {} -> {}",
+            record_type, record, old_ip
+        );
         self.call(&[
             ("cmd", "dns-remove_record"),
             ("record", record),
@@ -272,7 +300,6 @@ fn check_and_update(
     record_type: &str,
     dry_run: bool,
 ) -> Result<()> {
-
     match dh.get_dns_ip(record, record_type) {
         Ok(current_ip) => {
             // Existing record exists, update if necessary
@@ -286,7 +313,10 @@ fn check_and_update(
             warn!("{} record mismatch detected", record_type);
 
             if dry_run {
-                info!("DRY RUN: Would update {} record {} -> {}", record_type, current_ip, detected_ip);
+                info!(
+                    "DRY RUN: Would update {} record {} -> {}",
+                    record_type, current_ip, detected_ip
+                );
                 return Ok(());
             }
 
@@ -301,7 +331,10 @@ fn check_and_update(
                 warn!("{} record does not exist, creating new one", record_type);
 
                 if dry_run {
-                    info!("DRY RUN: Would create {} record -> {}", record_type, detected_ip);
+                    info!(
+                        "DRY RUN: Would create {} record -> {}",
+                        record_type, detected_ip
+                    );
                     return Ok(());
                 }
 
@@ -363,14 +396,19 @@ fn main() -> Result<()> {
 
     impl DetectionJob {
         fn run(self, dh: &Arc<DreamhostClient>) -> Result<()> {
-
             // helper to safely remove a DNS record if it exists
             let remove_stale_record = |record_type: &str, record_name: &str| -> Result<()> {
                 match dh.get_dns_ip(record_name, record_type) {
                     Ok(existing_ip) => {
-                        warn!("{} record exists but no WAN IP detected: {}", record_type, existing_ip);
+                        warn!(
+                            "{} record exists but no WAN IP detected: {}",
+                            record_type, existing_ip
+                        );
                         if self.dry_run {
-                            info!("DRY RUN: Would remove stale {} record {}", record_type, existing_ip);
+                            info!(
+                                "DRY RUN: Would remove stale {} record {}",
+                                record_type, existing_ip
+                            );
                         } else {
                             dh.call(&[
                                 ("cmd", "dns-remove_record"),
@@ -388,7 +426,11 @@ fn main() -> Result<()> {
 
             match detect_ip(&self.client, self.services, self.require_ipv4) {
                 Ok(ip) => {
-                    let ipv = if self.record_type=="A" { "IPV4" } else { "IPV6" };
+                    let ipv = if self.record_type == "A" {
+                        "IPV4"
+                    } else {
+                        "IPV6"
+                    };
                     info!("Detected {} WAN: {}", ipv, ip);
                     check_and_update(dh, &self.record_name, ip, self.record_type, self.dry_run)?;
                 }
@@ -433,7 +475,9 @@ fn main() -> Result<()> {
     }
 
     if jobs.is_empty() {
-        return Err(anyhow!("Both --ipv4-only and --ipv6-only flags cannot be used together; nothing to do"));
+        return Err(anyhow!(
+            "Both --ipv4-only and --ipv6-only flags cannot be used together; nothing to do"
+        ));
     }
 
     let handles: Vec<_> = jobs
@@ -452,9 +496,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-
 fn resolve_config(args: &Args) -> Result<Config> {
-
     let mut api_key = args.api_key.clone();
     let mut record = args.record.clone();
 
@@ -466,21 +508,21 @@ fn resolve_config(args: &Args) -> Result<Config> {
         record = std::env::var("DNS_RECORD").ok();
     }
 
-    if (api_key.is_none() || record.is_none()) && args.config.is_some() {
+    if api_key.is_none() || record.is_none() {
+        if let Some(config_path) = &args.config {
+            let cfg = load_config(config_path)?;
 
-        let cfg = load_config(args.config.as_ref().unwrap())?;
+            if api_key.is_none() {
+                api_key = Some(cfg.dreamhost_api_key);
+            }
 
-        if api_key.is_none() {
-            api_key = Some(cfg.dreamhost_api_key);
-        }
-
-        if record.is_none() {
-            record = Some(cfg.dns_record);
+            if record.is_none() {
+                record = Some(cfg.dns_record);
+            }
         }
     }
 
     if (api_key.is_none() || record.is_none()) && std::path::Path::new("config.toml").exists() {
-
         let cfg = load_config("config.toml")?;
 
         if api_key.is_none() {
@@ -507,7 +549,6 @@ fn load_config(path: &str) -> Result<Config> {
 }
 
 fn detect_ip(client: &Client, services: Vec<&str>, require_ipv4: bool) -> Result<IpAddr> {
-
     let mut services = services;
     services.shuffle(&mut rand::thread_rng());
 
@@ -515,14 +556,12 @@ fn detect_ip(client: &Client, services: Vec<&str>, require_ipv4: bool) -> Result
     let cancel = Arc::new(AtomicBool::new(false));
 
     for url in services {
-
         let tx = tx.clone();
         let client = client.clone();
         let cancel = cancel.clone();
         let url = url.to_string();
 
         thread::spawn(move || {
-
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
@@ -535,7 +574,6 @@ fn detect_ip(client: &Client, services: Vec<&str>, require_ipv4: bool) -> Result
                 .and_then(|text| text.trim().parse::<IpAddr>().ok());
 
             if let Some(ip) = result {
-
                 if require_ipv4 && !ip.is_ipv4() {
                     return;
                 }
@@ -563,7 +601,6 @@ fn detect_ip(client: &Client, services: Vec<&str>, require_ipv4: bool) -> Result
 }
 
 fn ipv4_services() -> Vec<&'static str> {
-
     vec![
         "https://icanhazip.com",
         "https://api.ipify.org",
@@ -574,7 +611,6 @@ fn ipv4_services() -> Vec<&'static str> {
 }
 
 fn ipv6_services() -> Vec<&'static str> {
-
     vec![
         "https://api64.ipify.org",
         "https://ipv6.icanhazip.com",
@@ -582,4 +618,136 @@ fn ipv6_services() -> Vec<&'static str> {
         "https://api-ipv6.ip.sb/ip",
         "https://ifconfig.co/ip",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::Method::GET;
+    use httpmock::MockServer;
+    use std::net::IpAddr;
+
+    #[test]
+    fn parses_ipv4_address() {
+        let ip: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(ip.is_ipv4());
+    }
+
+    #[test]
+    fn parses_ipv6_address() {
+        let ip: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(ip.is_ipv6());
+    }
+
+    #[test]
+    fn ipv6_is_not_ipv4() {
+        let ip: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(!ip.is_ipv4());
+    }
+
+    #[test]
+    fn api_error_uses_data_when_reason_missing() {
+        let resp = serde_json::json!({
+            "result": "error",
+            "data": "no_such_zone"
+        });
+
+        let msg = resp["reason"]
+            .as_str()
+            .or(resp["data"].as_str())
+            .unwrap_or("Unknown DreamHost API error");
+
+        assert_eq!(msg, "no_such_zone");
+    }
+
+    #[test]
+    fn no_update_when_ips_match() {
+        let existing = "1.2.3.4".parse::<IpAddr>().unwrap();
+        let detected = "1.2.3.4".parse::<IpAddr>().unwrap();
+
+        assert_eq!(existing, detected);
+    }
+
+    #[test]
+    fn test_dns_list_records_success() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(GET);
+
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{
+                    "result":"success",
+                    "data":[
+                        {
+                            "record":"test.example.com",
+                            "type":"A",
+                            "value":"1.2.3.4"
+                        }
+                    ]
+                }"#,
+                );
+        });
+
+        let client = reqwest::blocking::Client::new();
+
+        let dh = DreamhostClient::new_with_base(client, "fake_key".into(), server.url("/"));
+
+        let records = dh.list_records().unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].value, "1.2.3.4");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn test_rate_limit_error() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET);
+
+            then.status(200).body(
+                r#"{
+                    "result":"error",
+                    "data":"slow_down_bucko"
+                }"#,
+            );
+        });
+
+        let client = reqwest::blocking::Client::new();
+
+        let dh = DreamhostClient::new_with_base(client, "fake_key".into(), server.url("/"));
+
+        let result = dh.list_records();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_no_such_zone_error() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET);
+
+            then.status(200).body(
+                r#"{
+                    "result":"error",
+                    "data":"no_such_zone"
+                }"#,
+            );
+        });
+
+        let client = reqwest::blocking::Client::new();
+
+        let dh = DreamhostClient::new_with_base(client, "fake_key".into(), server.url("/"));
+
+        let result = dh.list_records();
+
+        assert!(result.is_err());
+    }
 }

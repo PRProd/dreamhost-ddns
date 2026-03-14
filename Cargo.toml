@@ -20,3 +20,6 @@ rand = "0.8"
 lto = true
 strip = true
 codegen-units = 1
+
+[dev-dependencies]
+httpmock = "0.7"
