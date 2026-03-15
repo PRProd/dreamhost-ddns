@@ -94,7 +94,7 @@ jobs:
 
       # ---- Upload release artifact ----
       - name: Upload release artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: dreamhost-ddns-${{ matrix.os }}
           path: release/archives/dreamhost-ddns-${{ matrix.os }}.zip
