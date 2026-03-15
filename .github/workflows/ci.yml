@@ -1,0 +1,100 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        target: [
+          x86_64-unknown-linux-gnu,
+          aarch64-unknown-linux-gnu,
+          armv7-unknown-linux-gnueabihf,
+          x86_64-apple-darwin,
+          aarch64-apple-darwin,
+          x86_64-pc-windows-msvc,
+          aarch64-pc-windows-msvc
+        ]
+
+    steps:
+      # ---- Checkout code ----
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---- Install Rust ----
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      # ---- Add target ----
+      - name: Add Rust target
+        if: matrix.target != runner.os
+        run: rustup target add ${{ matrix.target }}
+
+      # ---- Cache Cargo ----
+      - name: Cache cargo registry and build
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # ---- Formatting ----
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      # ---- Clippy ----
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # ---- Build ----
+      - name: Build
+        run: cargo build --verbose --target ${{ matrix.target }}
+
+      # ---- Test ----
+      - name: Run tests
+        run: cargo test --verbose --target ${{ matrix.target }}
+
+      # ---- Release build ----
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ---- Prepare release folder ----
+      - name: Prepare release folder
+        run: |
+          mkdir -p release
+          BIN_NAME=dreamhost-ddns${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+          cp target/${{ matrix.target }}/release/dreamhost-ddns${{ matrix.os == 'windows-latest' && '.exe' || '' }} \
+             release/dreamhost-ddns-${{ matrix.target }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+
+      # ---- Zip binaries per OS ----
+      - name: Zip binaries per OS
+        run: |
+          mkdir -p release/archives
+          OS_NAME=$(echo ${{ matrix.os }} | sed 's/-latest//')
+          zip -j release/archives/dreamhost-ddns-${OS_NAME}.zip release/dreamhost-ddns-* || true
+
+      # ---- Upload release artifact ----
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: dreamhost-ddns-${{ matrix.os }}
+          path: release/archives/dreamhost-ddns-${{ matrix.os }}.zip
